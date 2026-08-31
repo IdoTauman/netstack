@@ -1,12 +1,15 @@
 #include <linux/kernel.h>
 #include <linux/types.h>
+#include <linux/string.h>
 #include <linux/in.h>
 #include <linux/netdevice.h>
 #include <linux/skbuff.h>
 #include <linux/inetdevice.h>
+#include <net/sock.h>
 #include "ip.h"
 #include "udp.h"
 #include "net_utils.h"
+#include "custom_sock.h"
 
 static uint16_t udp_calc_csum(struct ip_hdr *ip, uint8_t *payload, size_t udp_len) {
     struct udp_hdr *udp = (struct udp_hdr *)payload;
@@ -19,29 +22,33 @@ static uint16_t udp_calc_csum(struct ip_hdr *ip, uint8_t *payload, size_t udp_le
 
     uint32_t sum = 0;
 
-    // sum 12 byte pseudo header (6 x 16bit)
+    // sum 12 byte pseudo header (6 x 16bit) -- ph is a local, naturally
+    // aligned struct so a direct 16-bit read is safe here.
     const uint16_t *ph_ptr = (const uint16_t *)&ph;
     for (size_t i = 0; i < sizeof(struct udp_pseudo_hdr) / 2; i++) {
         sum += ph_ptr[i];
     }
 
-    // sum udp datagram (header + data)
-    const uint16_t *udp_ptr = (const uint16_t *)payload;
-    size_t remaining = udp_len;
-    while (remaining > 1) {
-        sum += *udp_ptr++;
-        remaining -= 2;
+    // sum udp datagram (header + data). `payload` comes from a packet
+    // buffer with no alignment guarantee, so read via memcpy rather than
+    // dereferencing a uint16_t* directly.
+    size_t i = 0;
+    while (i + 1 < udp_len) {
+        uint16_t word;
+        memcpy(&word, payload + i, sizeof(word));
+        sum += word;
+        i += 2;
     }
-    if (remaining == 1) {
+    if (i < udp_len) {
         uint16_t odd_word = 0;
-        *(uint8_t *)&odd_word = *(const uint8_t *)udp_ptr;
+        ((uint8_t *)&odd_word)[0] = payload[i];
         sum += odd_word;
     }
 
     return checksum_fold(sum);
 }
 
-void udp_input(int tun_fd, struct ip_hdr *ip, uint8_t *payload, size_t len) {
+void udp_input(struct ip_hdr *ip, uint8_t *payload, size_t len) {
     // udp header length check
     if (len < sizeof(struct udp_hdr)) return;
 
@@ -64,25 +71,33 @@ void udp_input(int tun_fd, struct ip_hdr *ip, uint8_t *payload, size_t len) {
         }
     }
 
-    // log and echo on port 9000 for testing
     uint16_t src_p = ntohs(udp->src_port);
     uint16_t dst_p = ntohs(udp->dst_port);
 
     pr_info("[netstack] UDP %pI4:%u -> %pI4:%u (%zu bytes)\n",
             &ip->src_ip, src_p, &ip->dst_ip, dst_p, data_len);
 
-    // echo on port 9000 for logging
+    // deliver to a bound AF_CUSTOM socket, if one is listening on the
+    // destination address/port
+    struct sock *sk = custom_sock_lookup(ip->dst_ip, udp->dst_port);
+    if (sk) {
+        custom_sock_deliver(sk, ip->src_ip, udp->src_port, udp_data, data_len);
+        sock_put(sk);
+        return;
+    }
+
+    // no socket bound: keep the port-9000 echo for standalone testing
+    // without a userspace AF_CUSTOM client
     if (dst_p == 9000) {
         pr_info("[netstack] Echoing %zu bytes back to %pI4:%u\n", data_len, &ip->src_ip, src_p);
 
-        udp_send(tun_fd,
-                 ip->dst_ip, udp->dst_port,
+        udp_send(ip->dst_ip, udp->dst_port,
                  ip->src_ip, udp->src_port,
                  udp_data, data_len);
     }
 }
 
-void udp_send(int tun_fd, uint32_t src_ip, uint16_t src_port,
+void udp_send(uint32_t src_ip, uint16_t src_port,
               uint32_t dst_ip, uint16_t dst_port,
               const uint8_t *payload, size_t payload_len) {
     size_t ip_hlen = sizeof(struct ip_hdr);
@@ -92,8 +107,6 @@ void udp_send(int tun_fd, uint32_t src_ip, uint16_t src_port,
     struct net_device *dev;
     struct sk_buff *skb;
     uint8_t *pkt_buf;
-
-    (void)tun_fd;
 
     if (total_len > PACKET_LEN) {
         pr_warn("[netstack] Packet length %zu exceeds MTU\n", total_len);
@@ -114,6 +127,7 @@ void udp_send(int tun_fd, uint32_t src_ip, uint16_t src_port,
     }
 
     skb_reserve(skb, LL_RESERVED_SPACE(dev));
+    skb_reset_network_header(skb);
     pkt_buf = skb_put(skb, total_len);
 
     struct ip_hdr *ip = (struct ip_hdr *)pkt_buf;
@@ -131,8 +145,8 @@ void udp_send(int tun_fd, uint32_t src_ip, uint16_t src_port,
     udp->csum = 0;
 
     // ip header
-    ip->ihl = 5;
     ip->version = 4;
+    ip->ihl = 5;
     ip->tos = 0;
     ip->id = htons(1);
     ip->frag_off = 0;
@@ -147,6 +161,13 @@ void udp_send(int tun_fd, uint32_t src_ip, uint16_t src_port,
     uint16_t u_csum = udp_calc_csum(ip, (uint8_t *)udp, udp_total_len);
     udp->csum = (u_csum == 0) ? 0xFFFF : u_csum;
     ip->csum = checksum16(ip, ip_hlen);
+
+    // Prepend a link-layer header if the device needs one. This is a
+    // no-op on "lo" (loopback has no header_ops), but keeps udp_send()
+    // correct if it's ever pointed at a real interface.
+    if (dev_hard_header(skb, dev, ETH_P_IP, dev->broadcast, NULL, total_len) < 0) {
+        pr_warn("[netstack] dev_hard_header failed, sending without link header\n");
+    }
 
     skb->dev = dev;
     skb->protocol = htons(ETH_P_IP);

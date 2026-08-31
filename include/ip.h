@@ -20,6 +20,6 @@ struct __attribute__((packed)) ip_hdr {
 };
 
 /* Parses incoming buffer, verifies header/checksum, and demuxes to L4 */
-void ip_input(int tun_fd, uint8_t *buf, size_t len);
+void ip_input(uint8_t *buf, size_t len);
 
 #endif

@@ -6,6 +6,9 @@
 #include <linux/skbuff.h>
 #include <linux/inetdevice.h>
 #include <net/sock.h>
+#include <net/route.h>
+#include <net/ip.h>
+#include <net/dst.h>
 #include "ip.h"
 #include "udp.h"
 #include "net_utils.h"
@@ -104,7 +107,8 @@ void udp_send(uint32_t src_ip, uint16_t src_port,
     size_t udp_hlen = sizeof(struct udp_hdr);
     size_t udp_total_len = udp_hlen + payload_len;
     size_t total_len = ip_hlen + udp_total_len;
-    struct net_device *dev;
+    struct flowi4 fl4;
+    struct rtable *rt;
     struct sk_buff *skb;
     uint8_t *pkt_buf;
 
@@ -113,20 +117,35 @@ void udp_send(uint32_t src_ip, uint16_t src_port,
         return;
     }
 
-    dev = dev_get_by_name(&init_net, "lo");
-    if (!dev) {
-        pr_err("[netstack] Failed to find network interface\n");
+    // query kernel fib routing table for the destination ip
+    memset(&fl4, 0, sizeof(fl4));
+    fl4.daddr = dst_ip;
+    fl4.saddr = src_ip;
+    fl4.flowi4_proto = IP_PROTO_UDP;
+    fl4.fl4_dport = dst_port;
+    fl4.fl4_sport = src_port;
+
+    rt = ip_route_output_key(&init_net, &fl4);
+    if (IS_ERR(rt)) {
+        pr_err("[netstack] Route lookup failed for %pI4 (err=%ld)\n",
+               &dst_ip, PTR_ERR(rt));
         return;
     }
 
-    skb = alloc_skb(total_len + LL_RESERVED_SPACE(dev), GFP_ATOMIC);
+    // use routed source ip if our socket bound to 0.0.0.0 (INADDR_ANY) */
+    if (src_ip == 0) {
+        src_ip = fl4.saddr;
+    }
+
+    // allocate skb with headroom for the selected egress device
+    skb = alloc_skb(total_len + LL_RESERVED_SPACE(rt->dst.dev), GFP_ATOMIC);
     if (!skb) {
-        dev_put(dev);
+        ip_rt_put(rt);
         pr_err("[netstack] Failed to allocate sk_buff\n");
         return;
     }
 
-    skb_reserve(skb, LL_RESERVED_SPACE(dev));
+    skb_reserve(skb, LL_RESERVED_SPACE(rt->dst.dev));
     skb_reset_network_header(skb);
     pkt_buf = skb_put(skb, total_len);
 
@@ -138,13 +157,13 @@ void udp_send(uint32_t src_ip, uint16_t src_port,
         memcpy(data, payload, payload_len);
     }
 
-    // udp header
+    // populate udp Header
     udp->src_port = src_port;
     udp->dst_port = dst_port;
     udp->len = htons(udp_total_len);
     udp->csum = 0;
 
-    // ip header
+    // populate ipv4 header
     ip->version = 4;
     ip->ihl = 5;
     ip->tos = 0;
@@ -162,22 +181,16 @@ void udp_send(uint32_t src_ip, uint16_t src_port,
     udp->csum = (u_csum == 0) ? 0xFFFF : u_csum;
     ip->csum = checksum16(ip, ip_hlen);
 
-    // Prepend a link-layer header if the device needs one. This is a
-    // no-op on "lo" (loopback has no header_ops), but keeps udp_send()
-    // correct if it's ever pointed at a real interface.
-    if (dev_hard_header(skb, dev, ETH_P_IP, dev->broadcast, NULL, total_len) < 0) {
-        pr_warn("[netstack] dev_hard_header failed, sending without link header\n");
-    }
-
-    skb->dev = dev;
+    // attach routing entry and hand over to l3 stack
+    skb_dst_set(skb, &rt->dst);
+    skb->dev = rt->dst.dev;
     skb->protocol = htons(ETH_P_IP);
-    skb->pkt_type = PACKET_OUTGOING;
 
-    if (dev_queue_xmit(skb) < 0) {
-        pr_warn("[netstack] dev_queue_xmit failed to transmit packet\n");
-    } else {
-        pr_info("[netstack] Transmitted %zu bytes via %s\n", total_len, dev->name);
+    pr_info("[netstack] Egress via %s (GW: %pI4) -> %pI4\n",
+            rt->dst.dev->name, &rt->rt_gw4, &dst_ip);
+
+    // ip_local_out triggers arp neighbor resolution and l2 framing
+    if (ip_local_out(&init_net, NULL, skb) < 0) {
+        pr_warn("[netstack] ip_local_out failed transmission\n");
     }
-
-    dev_put(dev);
 }

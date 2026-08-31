@@ -2,7 +2,6 @@
 #define UDP_H
 
 #include <linux/types.h>
-#include <stddef.h>
 #include "ip.h"
 
 #define PACKET_LEN 1500

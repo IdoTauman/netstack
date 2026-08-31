@@ -1,6 +1,9 @@
 #include <linux/kernel.h>
 #include <linux/types.h>
 #include <linux/in.h>
+#include <linux/netdevice.h>
+#include <linux/skbuff.h>
+#include <linux/inetdevice.h>
 #include "ip.h"
 #include "udp.h"
 #include "net_utils.h"
@@ -82,35 +85,52 @@ void udp_input(int tun_fd, struct ip_hdr *ip, uint8_t *payload, size_t len) {
 void udp_send(int tun_fd, uint32_t src_ip, uint16_t src_port,
               uint32_t dst_ip, uint16_t dst_port,
               const uint8_t *payload, size_t payload_len) {
-    uint8_t packet[PACKET_LEN];
     size_t ip_hlen = sizeof(struct ip_hdr);
     size_t udp_hlen = sizeof(struct udp_hdr);
     size_t udp_total_len = udp_hlen + payload_len;
     size_t total_len = ip_hlen + udp_total_len;
+    struct net_device *dev;
+    struct sk_buff *skb;
+    uint8_t *pkt_buf;
 
-    // header length check
+    (void)tun_fd;
+
     if (total_len > PACKET_LEN) {
         pr_warn("[netstack] Packet length %zu exceeds MTU\n", total_len);
         return;
     }
 
-    // overlay headers and extract data pointer
-    struct ip_hdr *ip = (struct ip_hdr *)packet;
-    struct udp_hdr *udp = (struct udp_hdr *)(packet + ip_hlen);
-    uint8_t *data = packet + ip_hlen + udp_hlen;
+    dev = dev_get_by_name(&init_net, "lo");
+    if (!dev) {
+        pr_err("[netstack] Failed to find network interface\n");
+        return;
+    }
 
-    // copy payload data
+    skb = alloc_skb(total_len + LL_RESERVED_SPACE(dev), GFP_ATOMIC);
+    if (!skb) {
+        dev_put(dev);
+        pr_err("[netstack] Failed to allocate sk_buff\n");
+        return;
+    }
+
+    skb_reserve(skb, LL_RESERVED_SPACE(dev));
+    pkt_buf = skb_put(skb, total_len);
+
+    struct ip_hdr *ip = (struct ip_hdr *)pkt_buf;
+    struct udp_hdr *udp = (struct udp_hdr *)(pkt_buf + ip_hlen);
+    uint8_t *data = pkt_buf + ip_hlen + udp_hlen;
+
     if (payload && payload_len > 0) {
         memcpy(data, payload, payload_len);
     }
 
-    // populate udp header
+    // udp header
     udp->src_port = src_port;
     udp->dst_port = dst_port;
     udp->len = htons(udp_total_len);
     udp->csum = 0;
 
-    // populate ip header
+    // ip header
     ip->ihl = 5;
     ip->version = 4;
     ip->tos = 0;
@@ -123,14 +143,20 @@ void udp_send(int tun_fd, uint32_t src_ip, uint16_t src_port,
     ip->total_len = htons(total_len);
     ip->csum = 0;
 
-    // calculate udp checksum (covers pseudo header + datagram)
+    // checksums
     uint16_t u_csum = udp_calc_csum(ip, (uint8_t *)udp, udp_total_len);
     udp->csum = (u_csum == 0) ? 0xFFFF : u_csum;
-
-    // calculate ip checksum (covers 20 byte ip header only)
     ip->csum = checksum16(ip, ip_hlen);
 
-    // transmit
-    // TODO: change this to kernel space
-    write(tun_fd, packet, total_len);
+    skb->dev = dev;
+    skb->protocol = htons(ETH_P_IP);
+    skb->pkt_type = PACKET_OUTGOING;
+
+    if (dev_queue_xmit(skb) < 0) {
+        pr_warn("[netstack] dev_queue_xmit failed to transmit packet\n");
+    } else {
+        pr_info("[netstack] Transmitted %zu bytes via %s\n", total_len, dev->name);
+    }
+
+    dev_put(dev);
 }

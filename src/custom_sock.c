@@ -157,36 +157,39 @@ static int custom_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len
 static int custom_sendmsg(struct socket *sock, struct msghdr *msg, size_t len) {
     struct sockaddr_custom *dst = (struct sockaddr_custom *)msg->msg_name;
     struct custom_sock_data *priv = (struct custom_sock_data *)sock->sk->sk_user_data;
-    uint8_t kbuf[PACKET_LEN];
+    uint8_t *kbuf;
     int err;
 
-    // verify destination address was passed via sendto()
     if (!dst || msg->msg_namelen < sizeof(struct sockaddr_custom))
         return -EDESTADDRREQ;
 
-    if (len > sizeof(kbuf))
+    if (len > PACKET_LEN)
         return -EMSGSIZE;
-    
-    // if unbound autobind to an ephemeral port
+
     if (priv->bound_port == 0) {
         err = custom_autobind(sock->sk);
         if (err) return err;
     }
 
-    // copy payload data from userspace memory into kernel buffer
+    kbuf = kmalloc(len, GFP_KERNEL);
+    if (!kbuf)
+        return -ENOMEM;
+
     err = copy_from_iter(kbuf, len, &msg->msg_iter);
-    if (err != len)
+    if (err != len) {
+        kfree(kbuf);
         return -EFAULT;
+    }
 
     pr_info("[custom_sock] sendmsg: %zu bytes -> %pI4:%u\n",
             len, &dst->sc_addr, ntohs(dst->sc_port));
 
-    // invoke udp transmission logic
     udp_send(-1,
              priv->bound_ip, priv->bound_port,
              dst->sc_addr, dst->sc_port,
              kbuf, len);
 
+    kfree(kbuf);
     return len;
 }
 

@@ -2,7 +2,6 @@
 #define IP_H
 
 #include <linux/types.h>
-#include <stddef.h>
 
 #define IP_PROTO_UDP 17
 #define NETSTACK_TTL_DEFAULT 64

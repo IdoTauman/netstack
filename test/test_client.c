@@ -5,7 +5,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 
-#define AF_CUSTOM          99
+#define AF_CUSTOM          45
 #define SOCK_CUSTOM_DGRAM  2
 
 struct sockaddr_custom {
